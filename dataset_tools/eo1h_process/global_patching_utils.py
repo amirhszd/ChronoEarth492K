@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Any
-import math, os
+import math, os, re
 import numpy as np
 import rasterio
 import geopandas as gpd
@@ -16,6 +16,15 @@ from dataset_tools.eo1h_process.utils import parse_metadata, update_metadata_jso
 from rasterio.transform import array_bounds
 import json
 from rasterio.vrt import WarpedVRT
+
+# Stable Hyperion bands (Datt et al. 2003, Table IV)
+STABLE_BANDS: List[int] = (
+    list(range(10, 58))
+    + list(range(81, 98))
+    + list(range(101, 120))
+    + list(range(134, 165))
+    + list(range(182, 222))
+)
 
 # CRS_WGS84 = "EPSG:4326"
 P = 30.0             # meters per pixel (exact)
@@ -127,6 +136,29 @@ def write_patch_tif(path:str, data:np.ndarray, transform:Affine, crs:CRS):
     with rasterio.open(path, "w", **profile) as dst:
         dst.write(data)
 
+def _parse_year_day(filename: str) -> Tuple[str, str]:
+    """Parse (year, day) from a TIF filename.
+
+    Handles two formats:
+    - Stacked:   EO1H32609:142:2012_2012213.TIF    → year='2012', day='213'
+      (date appears as a standalone _YYYYDDD token after the first underscore)
+    - Per-band:  EO1H326091422012213_B010_L1T.TIF  → year='2012', day='213'
+      (date is the last 7 digits of the entity-ID prefix)
+    """
+    base = os.path.basename(filename)
+    # Stacked format: explicit _YYYYDDD token followed by '.' or '_'
+    m = re.search(r'_(\d{4})(\d{3})(?:\.|_)', base)
+    if m:
+        return m.group(1), m.group(2)
+    # Per-band format: YYYYDDD are the last 7 chars of the entity-ID prefix
+    entity_id = base.split('_')[0]
+    suffix = entity_id[-7:]
+    if suffix.isdigit():
+        return suffix[:4], suffix[4:]
+    # Final fallback: original character-based parsing
+    return base[10:14], base[14:17]
+
+
 # # --------------------------
 # # 3) Orchestrator (one GeoTIFF)
 # # --------------------------
@@ -135,7 +167,11 @@ def tile_image_with_grids(geotiff_dir:str, patch_save_dir:str,
                         write:bool=True) -> Dict:
     """
     1) Read UTM zone/CRS from image; 2) use its footprint as AOI; 3) build N grids; 4) cut patches.
-    If pixel_size=None, infer from image transform (abs(pixel width)).
+
+    Supports two input layouts:
+    - **Per-band** (standard): directory contains one TIF per band plus a .TXT metadata file.
+    - **Stacked** (single-file): directory contains exactly one multi-band TIF (155 bands = STABLE_BANDS).
+      A .TXT metadata file is optional for the stacked format.
     """
     save_top_dir_template: str='EO1H{locationId}'
     save_dir_template: str='EO1H{locationId}_{year}{day}'
@@ -144,15 +180,22 @@ def tile_image_with_grids(geotiff_dir:str, patch_save_dir:str,
     
     geotiffs = glob.glob(os.path.join(geotiff_dir, "*.TIF"))
     geotiffs.sort()
-    
-    metadata_path = glob.glob(os.path.join(geotiff_dir, "*.TXT"))[0]
-    metadata = parse_metadata(metadata_path, patch_size=N)
-    
-    # Get the first geotiff
+
+    # Detect stacked format: single TIF with more than one band
+    with rasterio.open(geotiffs[0]) as probe:
+        is_stacked = len(geotiffs) == 1 and probe.count > 1
+
+    # Metadata TXT is required for per-band format; optional for stacked
+    txt_files = glob.glob(os.path.join(geotiff_dir, "*.TXT"))
+    if txt_files:
+        metadata = parse_metadata(txt_files[0], patch_size=N)
+    elif is_stacked:
+        metadata = {"L1_METADATA_FILE": {"PRODUCT_METADATA": {}}}
+    else:
+        raise FileNotFoundError(f"No .TXT metadata file found in {geotiff_dir}")
+
     first_geotiff = geotiffs[0]
-    first_name = os.path.basename(first_geotiff)
-    year = first_name[10:14]
-    day = first_name[14:17]
+    year, day = _parse_year_day(first_geotiff)
     
     metadata_dict: Dict[int, Dict[str, Any]] = {}
     with rasterio.open(first_geotiff) as src:
@@ -186,20 +229,39 @@ def tile_image_with_grids(geotiff_dir:str, patch_save_dir:str,
             "save_metadata": save_metadata,
             "metadata": new_metadata
         }
-        
-    
-    for geotiff in geotiffs:
-        band_name = os.path.basename(geotiff)
-        band = band_name.split("_")[1][1:]  # after 'B'
-        with rasterio.open(geotiff) as src:
-            for _, row in metadata_rows.iterrows():
-                location_id = row["location_uid"]
-                save_name = save_name_template.format(locationId=location_id, year=year, day=day, band=band)
-                aff = row["transform"]
-                crs = CRS.from_epsg(row["crs"])
+
+    if is_stacked:
+        # All 155 bands are already in patched_dict as (155, H, W) arrays.
+        # Band index i (0-based) in the stacked file corresponds to STABLE_BANDS[i].
+        for _, row in metadata_rows.iterrows():
+            location_id = row["location_uid"]
+            patch_data = patched_dict[location_id]  # (155, H, W)
+            aff = row["transform"]
+            crs = CRS.from_epsg(row["crs"])
+            for band_idx, hyperion_band in enumerate(STABLE_BANDS):
+                save_name = save_name_template.format(
+                    locationId=location_id, year=year, day=day,
+                    band=f"{hyperion_band:03d}"
+                )
                 out_path = os.path.join(metadata_dict[location_id]["save_dir"], save_name)
-                metadata_dict[location_id]["metadata"]["L1_METADATA_FILE"]["PRODUCT_METADATA"][f"BAND{int(band)}_FILE_NAME"] = save_name
-                cut_raster_to_tile_with_transform(src, out_path, aff, crs, nodata_rate_max=nodata_rate_max, write=write)
+                metadata_dict[location_id]["metadata"]["L1_METADATA_FILE"]["PRODUCT_METADATA"][
+                    f"BAND{hyperion_band}_FILE_NAME"
+                ] = save_name
+                if write:
+                    write_patch_tif(out_path, patch_data[band_idx:band_idx + 1], aff, crs)
+    else:
+        for geotiff in geotiffs:
+            band_name = os.path.basename(geotiff)
+            band = band_name.split("_")[1][1:]  # after 'B'
+            with rasterio.open(geotiff) as src:
+                for _, row in metadata_rows.iterrows():
+                    location_id = row["location_uid"]
+                    save_name = save_name_template.format(locationId=location_id, year=year, day=day, band=band)
+                    aff = row["transform"]
+                    crs = CRS.from_epsg(row["crs"])
+                    out_path = os.path.join(metadata_dict[location_id]["save_dir"], save_name)
+                    metadata_dict[location_id]["metadata"]["L1_METADATA_FILE"]["PRODUCT_METADATA"][f"BAND{int(band)}_FILE_NAME"] = save_name
+                    cut_raster_to_tile_with_transform(src, out_path, aff, crs, nodata_rate_max=nodata_rate_max, write=write)
         
     # add the dir_name column to the metadata_rows
     scene_id = geotiff_dir.split("/")[-1]

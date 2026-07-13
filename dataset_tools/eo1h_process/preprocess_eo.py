@@ -96,6 +96,23 @@ def unzip_patchify_verify(zip_filename: str, region_dir: str, unzip_dir: str, pa
     return stats["kept"]
 
 
+def process_stacked_tif(
+    tif_filename: str,
+    region_dir: str,
+    unzip_dir: str,
+    patched_dir: str,
+    nodata_thresh: float,
+) -> int:
+    """Process a single stacked TIF (all stable bands in one file)."""
+    scene_id = tif_filename.rsplit(".", 1)[0]
+    scene_dir = os.path.join(unzip_dir, scene_id)
+    os.makedirs(scene_dir, exist_ok=True)
+    shutil.copy2(os.path.join(region_dir, tif_filename), scene_dir)
+    stats, _ = tile_image_with_grids(scene_dir, patched_dir, nodata_rate_max=nodata_thresh)
+    shutil.rmtree(scene_dir, ignore_errors=True)
+    return stats["kept"]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -117,6 +134,15 @@ def main() -> None:
         default=0.1,
         help="No-data threshold for patch validity.",
     )
+    parser.add_argument(
+        "--stacked",
+        action="store_true",
+        help=(
+            "Process stacked TIF files (all stable bands in a single file) "
+            "instead of per-band zip archives. "
+            "The region directory should contain one .TIF file per scene."
+        ),
+    )
     args = parser.parse_args()
 
     dirs = ensure_directories(args.save_dir, args.region)
@@ -124,37 +150,69 @@ def main() -> None:
     unzip_dir = dirs["unzip_dir"]
     patched_dir = dirs["patched_dir"]
 
-    zip_files = list_zip_files(region_dir)
-    if not zip_files:
-        print(f"No .zip files found in {region_dir}. Nothing to process.")
-        return
+    if args.stacked:
+        tif_files = sorted([f for f in os.listdir(region_dir) if f.lower().endswith(".tif")])
+        if not tif_files:
+            print(f"No .TIF files found in {region_dir}. Nothing to process.")
+            return
 
-    total_patches = 0
-    with tqdm(total=len(zip_files), desc="Processing files") as pbar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
-            future_to_zip = {
-                ex.submit(
-                    unzip_patchify_verify,
-                    zf,
-                    region_dir,
-                    unzip_dir,
-                    patched_dir,
-                    args.nodata_thresh,
-                ): zf
-                for zf in zip_files
-            }
+        total_patches = 0
+        with tqdm(total=len(tif_files), desc="Processing stacked TIF files") as pbar:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+                future_to_tif = {
+                    ex.submit(
+                        process_stacked_tif,
+                        tf,
+                        region_dir,
+                        unzip_dir,
+                        patched_dir,
+                        args.nodata_thresh,
+                    ): tf
+                    for tf in tif_files
+                }
 
-            for future in concurrent.futures.as_completed(future_to_zip):
-                zf_name = future_to_zip[future]
-                try:
-                    created = future.result()
-                    total_patches += int(created)
-                except Exception as exc:
-                    # Keep going even if one file fails; report the failure
-                    print(f"Failed processing {zf_name}: {exc}")
-                finally:
-                    pbar.update(1)
-                    pbar.set_postfix({"patches": total_patches})
+                for future in concurrent.futures.as_completed(future_to_tif):
+                    tf_name = future_to_tif[future]
+                    try:
+                        created = future.result()
+                        total_patches += int(created)
+                    except Exception as exc:
+                        print(f"Failed processing {tf_name}: {exc}")
+                    finally:
+                        pbar.update(1)
+                        pbar.set_postfix({"patches": total_patches})
+    else:
+        zip_files = list_zip_files(region_dir)
+        if not zip_files:
+            print(f"No .zip files found in {region_dir}. Nothing to process.")
+            return
+
+        total_patches = 0
+        with tqdm(total=len(zip_files), desc="Processing files") as pbar:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+                future_to_zip = {
+                    ex.submit(
+                        unzip_patchify_verify,
+                        zf,
+                        region_dir,
+                        unzip_dir,
+                        patched_dir,
+                        args.nodata_thresh,
+                    ): zf
+                    for zf in zip_files
+                }
+
+                for future in concurrent.futures.as_completed(future_to_zip):
+                    zf_name = future_to_zip[future]
+                    try:
+                        created = future.result()
+                        total_patches += int(created)
+                    except Exception as exc:
+                        # Keep going even if one file fails; report the failure
+                        print(f"Failed processing {zf_name}: {exc}")
+                    finally:
+                        pbar.update(1)
+                        pbar.set_postfix({"patches": total_patches})
 
     # remove unzip dir
     shutil.rmtree(unzip_dir, ignore_errors=True)
