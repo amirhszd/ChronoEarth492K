@@ -155,7 +155,9 @@ def _parse_year_day(filename: str) -> Tuple[str, str]:
     suffix = entity_id[-7:]
     if suffix.isdigit():
         return suffix[:4], suffix[4:]
-    # Final fallback: original character-based parsing
+    # Final fallback for entity IDs whose last 7 chars are not pure digits
+    # (e.g. trailing station/version codes).  Positions 10-16 work for the
+    # canonical EO1H{PPP}{RRR}{YYYY}{DDD} format (3-digit path, 3-digit row).
     return base[10:14], base[14:17]
 
 
@@ -184,6 +186,11 @@ def tile_image_with_grids(geotiff_dir:str, patch_save_dir:str,
     # Detect stacked format: single TIF with more than one band
     with rasterio.open(geotiffs[0]) as probe:
         is_stacked = len(geotiffs) == 1 and probe.count > 1
+        if is_stacked and probe.count != len(STABLE_BANDS):
+            raise ValueError(
+                f"Stacked TIF has {probe.count} bands but expected {len(STABLE_BANDS)} "
+                f"(one per STABLE_BANDS entry). Verify the input file."
+            )
 
     # Metadata TXT is required for per-band format; optional for stacked
     txt_files = glob.glob(os.path.join(geotiff_dir, "*.TXT"))

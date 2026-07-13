@@ -104,7 +104,7 @@ def process_stacked_tif(
     nodata_thresh: float,
 ) -> int:
     """Process a single stacked TIF (all stable bands in one file)."""
-    scene_id = tif_filename.rsplit(".", 1)[0]
+    scene_id = os.path.splitext(tif_filename)[0]
     scene_dir = os.path.join(unzip_dir, scene_id)
     os.makedirs(scene_dir, exist_ok=True)
     shutil.copy2(os.path.join(region_dir, tif_filename), scene_dir)
